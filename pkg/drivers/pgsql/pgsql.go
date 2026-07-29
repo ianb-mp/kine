@@ -3,8 +3,9 @@ package pgsql
 import (
 	"context"
 	"database/sql"
-	"database/sql/driver"
+	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -12,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	awsauth "github.com/aws/aws-sdk-go-v2/feature/rds/auth"
 	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -64,13 +67,13 @@ var (
 )
 
 func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, server.Backend, error) {
-	config, err := prepareConfig(cfg.DataSourceName, cfg.BackendTLSConfig)
+	config, connOpts, err := prepareConfig(ctx, cfg.DataSourceName, cfg.BackendTLSConfig)
 	if err != nil {
 		return false, nil, err
 	}
 
-	connector := stdlib.GetConnector(*config)
-	if err := createDBIfNotExist(ctx, config, connector); err != nil {
+	connector := stdlib.GetConnector(*config, connOpts...)
+	if err := createDBIfNotExist(ctx, config, connOpts); err != nil {
 		return false, nil, err
 	}
 
@@ -179,10 +182,10 @@ func setup(db *sql.DB) error {
 	return nil
 }
 
-func createDBIfNotExist(ctx context.Context, config *pgx.ConnConfig, connector driver.Connector) error {
+func createDBIfNotExist(ctx context.Context, config *pgx.ConnConfig, connOpts []stdlib.OptionOpenDB) error {
 	createConfig := config.Copy()
 	createConfig.Database = "postgres"
-	connector = stdlib.GetConnector(*createConfig)
+	connector := stdlib.GetConnector(*createConfig, connOpts...)
 	conn, err := connector.Connect(ctx)
 	if err != nil {
 		logrus.Warnf("failed to ensure existence of database %s: unable to connect to default postgres database: %v", createConfig.Database, err)
@@ -211,7 +214,7 @@ func createDBIfNotExist(ctx context.Context, config *pgx.ConnConfig, connector d
 	return nil
 }
 
-func prepareConfig(dataSourceName string, tlsInfo tls.Config) (*pgx.ConnConfig, error) {
+func prepareConfig(ctx context.Context, dataSourceName string, tlsInfo tls.Config) (*pgx.ConnConfig, []stdlib.OptionOpenDB, error) {
 	if len(dataSourceName) == 0 {
 		dataSourceName = defaultDSN
 	} else {
@@ -219,7 +222,7 @@ func prepareConfig(dataSourceName string, tlsInfo tls.Config) (*pgx.ConnConfig, 
 	}
 	u, err := util.ParseURL(dataSourceName)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(u.Path) == 0 || u.Path == "/" {
 		u.Path = "/kubernetes"
@@ -231,7 +234,7 @@ func prepareConfig(dataSourceName string, tlsInfo tls.Config) (*pgx.ConnConfig, 
 
 	queryMap, err := url.ParseQuery(u.RawQuery)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// set up tls dsn
 	params := url.Values{}
@@ -257,10 +260,55 @@ func prepareConfig(dataSourceName string, tlsInfo tls.Config) (*pgx.ConnConfig, 
 	u.RawQuery = params.Encode()
 	config, err := pgx.ParseConfig(u.String())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	config.DialFunc = dialer.CachingDialer.DialContext
-	return config, nil
+
+	// When no password is supplied in the DSN, fall back to the AWS default
+	// credential provider chain to authenticate via RDS IAM. An auth token is
+	// generated per physical connection (see awsIAMAuthOption), so token expiry
+	// is handled transparently as the connection pool recycles connections.
+	var connOpts []stdlib.OptionOpenDB
+	if config.Password == "" {
+		logrus.Infof("No password supplied in datastore DSN; using AWS default credential provider to generate RDS IAM authentication tokens for user %q", config.User)
+		if config.TLSConfig == nil {
+			logrus.Warnf("RDS IAM authentication requires TLS but sslmode appears to be disabled; the connection is likely to be rejected")
+		}
+		opt, err := awsIAMAuthOption(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		connOpts = append(connOpts, opt)
+	}
+
+	return config, connOpts, nil
+}
+
+// awsIAMAuthOption returns a pgx stdlib BeforeConnect option that populates the
+// connection password with a freshly generated RDS IAM authentication token,
+// sourcing the signing credentials from the AWS default credential provider
+// chain. The token is regenerated for every new physical connection, so the
+// ~15 minute token lifetime is honoured as the connection pool opens and
+// recycles connections.
+func awsIAMAuthOption(ctx context.Context) (stdlib.OptionOpenDB, error) {
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load AWS configuration for RDS IAM authentication: %w", err)
+	}
+	if awsCfg.Region == "" {
+		return nil, errors.New("no AWS region configured for RDS IAM authentication; set AWS_REGION or configure a region in the AWS profile/config")
+	}
+
+	hook := func(ctx context.Context, connConfig *pgx.ConnConfig) error {
+		endpoint := net.JoinHostPort(connConfig.Host, strconv.Itoa(int(connConfig.Port)))
+		token, err := awsauth.BuildAuthToken(ctx, endpoint, awsCfg.Region, connConfig.User, awsCfg.Credentials)
+		if err != nil {
+			return fmt.Errorf("failed to generate RDS IAM authentication token: %w", err)
+		}
+		connConfig.Password = token
+		return nil
+	}
+	return stdlib.OptionBeforeConnect(hook), nil
 }
 
 func init() {
